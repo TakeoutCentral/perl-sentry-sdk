@@ -21,34 +21,46 @@ sub around ($package, $method, $cb) {
 }
 
 sub setup_once ($self, $add_global_event_processor, $get_current_hub) {
+  return if (!$self->breadcrumbs && !$self->tracing);
 
-  around(
-    'DBI::db',
-    do => sub ($orig, $dbh, $statement, @args) {
-      my $hub = $get_current_hub->();
+  my $do_around = sub {
+    my ($method, @args) = @_;
+    around(
+      'DBI::db',
+      $method => sub ($orig, $dbh, $statement, @args) {
+        my $hub = $get_current_hub->();
 
-      my $span;
+        my $span;
 
-      if ($self->tracing && (my $parent_span = $hub->get_scope()->get_span)) {
-        $span = $parent_span->start_child({
-          op => 'sql.query', description => $statement, });
+        if ($self->tracing && (my $parent_span = $hub->get_scope()->get_span)) {
+          $span = $parent_span->start_child({
+            op          => 'db.sql.query',
+            description => $statement,
+            data        => { args => [@args], },
+          });
+        }
+
+        my $value = $orig->($dbh, $statement, @args);
+
+        if (defined $span && $self->tracing) {
+          $span->finish();
+        }
+
+        return $value;
       }
+    );
+  };
 
-      my $value = $orig->($dbh, $statement, @args);
-
-      $hub->add_breadcrumb({
-        type => 'query', category => 'do', data => { sql => $statement }, })
-        if $self->breadcrumbs;
-
-      if (defined $span && $self->tracing) {
-        $span->finish();
-      }
-
-      return $value;
-    }
+  my @symbols = (
+    'do',                 'selectrow_array',
+    'selectrow_arrayref', 'selectrow_hashref',
+    'selectall_arrayref', 'selectall_hashref',
+    'selectcol_arrayref',
   );
 
-  return if (!$self->breadcrumbs && !$self->tracing);
+  for (@symbols) {
+    $do_around->($_);
+  }
 
   around(
     'DBI::st',
@@ -61,20 +73,13 @@ sub setup_once ($self, $add_global_event_processor, $get_current_hub) {
 
       if ($self->tracing && (my $parent_span = $hub->get_scope()->get_span)) {
         $span = $parent_span->start_child({
-          op          => 'sql.query',
+          op          => 'db.sql.query',
           description => $statement,
           data        => { args => [@args], },
         });
       }
 
       my $value = $orig->($sth, @args);
-
-      $hub->add_breadcrumb({
-        type     => 'query',
-        category => 'execute',
-        data     => { sql => $statement, args => [@args], },
-      })
-        if $self->breadcrumbs;
 
       if (defined $span && $self->tracing) {
         $span->finish();
